@@ -55,7 +55,7 @@ everything before the next call.
 1. Get the project into a folder of your choice. You can clone it:
 
    ```
-   git clone https://github.com/<owner>/api-cache-mcp.git
+   git clone https://github.com/diegoperini/api-cache-mcp.git
    ```
 
    Or download the ZIP and extract it. The rest of this guide calls that
@@ -226,4 +226,4 @@ locally is encrypted.
 
 ## License
 
-Add your license here before publishing.
+[MIT](LICENSE)
