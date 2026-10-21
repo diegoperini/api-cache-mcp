@@ -13,6 +13,11 @@ everything before the next call.
   Claude Desktop or Claude Code.
 - **Local use only.** See [Security](#security-local-use-only).
 
+> [!NOTE]
+> **Maintainer's note**
+>
+> Hi! Obviously, everything in this README is written by an AI, but this one paragraph is fully mine to write. I built this because I drive headless Blender, Unreal Engine and many other tools that may or may not have any MCPs, and over time, I realized my token consumption was growing beyond what I can afford with my modest budget. This tool helped me save money and also gave a small speed boost to the responses to my prompts. If you wanna give it a try, fork it and make it yours by adding custom context. You can also use it as is, since it already provides the toolset to populate it with knowledge. This tool cannot have conversations, and that's not a bug but a feature. Enjoy hacking!
+
 ## How it works
 
 - Each agent has one cache per API: a free-form text file in that agent's
