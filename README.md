@@ -78,7 +78,7 @@ everything before the next call.
    | `CLAUDE_MODEL` | `claude-haiku-5-5` | Model for every call |
    | `CLAUDE_MAX_TOKENS` | `4096` | Output limit per call |
    | `CLAUDE_CACHE_TTL` | `5m` | Prompt cache lifetime: `5m` or `1h` |
-   | `MCP_UI_PORT` | `8765` | Debug page port (tries the next 9 if busy) |
+   | `MCP_UI_PORT` | `8765` | Debug page port (tries the next 9 if busy). Only held while the debug window is open |
    | `MCP_UI_OPEN` | `true` | Open the debug window at startup |
 
 3. Optionally, edit `system-prompt.md` and put reference material in
@@ -174,6 +174,22 @@ The window closes when the server stops. Only one window is ever open, even
 when several server instances are running. If you close it by accident, ask
 any connected agent to call `debug_open_webview`.
 
+The port is only held while the window is open. Each server instance takes a
+port when its window opens and releases it when the window closes, so closed
+windows never block other programs or other instances. The server notices a
+closed window in three ways:
+
+- the page says goodbye when it closes (after 5 seconds, so a reload keeps
+  the port);
+- the Edge window's process no longer has a window (checked every 5 seconds);
+- the page sends no request for 3 minutes (a backstop, for example for a
+  default-browser tab left open after the computer slept).
+
+Reopening may use a different port. History and the server log are kept in
+memory while the window is closed and show up again when it reopens. With
+`MCP_UI_OPEN=false`, no port is taken until an agent calls
+`debug_open_webview`.
+
 ## Files
 
 | Path | What it is |
@@ -221,6 +237,9 @@ locally is encrypted.
 - **Tools don't show up in Claude Desktop:** check
   `%APPDATA%\Claude\logs\mcp-server-api-cache.log`. The server only writes to
   the terminal on a fatal error, or when no debug port is free.
+- **The debug window says "page closed":** the server released the page's
+  port after deciding the window was gone. Ask any connected agent to call
+  `debug_open_webview`.
 - **`cache 0 read / 0 written` on every call:** the cached prefix is shorter
   than the model's minimum (512 tokens for Haiku 5.5). Add more to
   `system-prompt.md` or `context\`, or wait until the cache itself grows.
@@ -231,4 +250,4 @@ locally is encrypted.
 
 ## License
 
-[MIT](LICENSE)
+[Apache License 2.0](LICENSE). Copyright 2026 Diego Perini; see [NOTICE](NOTICE).

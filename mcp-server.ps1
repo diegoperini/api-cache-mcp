@@ -1,4 +1,4 @@
-<#
+﻿<#
   Claude prompt MCP server + local debug UI, for Windows PowerShell 5.1.
 
   - MCP over stdio (newline-delimited JSON-RPC 2.0) with ONE tool: ask_claude.
@@ -6,6 +6,8 @@
   - A debug page on http://localhost:<port>/ shows every call (from the MCP
     client or from the page itself) and can send prompts through the same
     MCP code path. It opens in an Edge app window, else the default browser.
+    The page's port is only held while the window is open: it is taken when
+    the window opens and released when the window closes.
   - History is kept in history.jsonl next to this script.
 
   Launch through mcp-server.bat. RULE: stdout is reserved for protocol
@@ -1132,7 +1134,7 @@ function Invoke-McpMessage($Msg) {
             return (New-RpcResult $Msg.id @{
                 protocolVersion = $version
                 capabilities    = @{ tools = @{} }
-                serverInfo      = @{ name = 'api-cache'; version = '0.4.0' }
+                serverInfo      = @{ name = 'api-cache'; version = '0.5.0' }
                 instructions    = $script:ServerInstructions
             })
         }
@@ -1407,8 +1409,10 @@ async function poll() {
     addLogs(d.logs || []);
     addEntries(d.entries || []);
   } catch (err) {
-    // 403 = a newer server instance is running with a new token; it opened its own window.
-    setStatus(false, null, err.status === 403 ? 'server restarted - use the new window' : null);
+    // 403 = another server instance now owns this port (it opened its own window).
+    // No answer = the page was released or the server stopped.
+    setStatus(false, null, err.status === 403 ? 'another server owns this port - use its window'
+                                              : 'page closed - ask an agent to call debug_open_webview');
   }
   finally { polling = false; }
 }
@@ -1448,6 +1452,11 @@ input.addEventListener('keydown', (ev) => {
   }
 });
 
+// Tell the server the page is going away, so it can release its port.
+// A reload also fires this; the server waits a few seconds for the page to come back.
+// sendBeacon can't set headers, so the token travels in the query string.
+addEventListener('pagehide', () => { navigator.sendBeacon('/api/bye?token=' + TOKEN); });
+
 poll().then(toBottom);
 setInterval(poll, 1000);
 input.focus();
@@ -1460,17 +1469,84 @@ $script:UiToken = [guid]::NewGuid().ToString('N')
 $script:UiHtml  = $script:UiHtml.Replace('__TOKEN__', $script:UiToken)
 $script:WebCallCount = 0
 
+# --- Debug page lifetime: the port is held only while the window is open ---
+# The listener starts when the window opens (at startup or debug_open_webview)
+# and stops when the window closes, which frees the port for other programs
+# and other api-cache instances. A closed window is noticed by:
+#   1. the page's goodbye beacon (pagehide), after a short grace for reloads;
+#   2. Edge mode: our window's Edge processes are gone;
+#   3. backstop: no request from the page for UiIdleLimitMs of waiting time.
+#      Chromium slows timers in hidden pages to about one per minute, so the
+#      limit stays well above that.
+# Idle time only counts while the main loop is waiting, so a long Claude call
+# (which blocks the loop and the page's polls) never looks like a closed window.
+$script:Listener        = $null
+$script:CtxTask         = $null
+$script:UiUrl           = $null
+$script:UiPageSeen      = $false
+$script:UiIdleMs        = 0
+$script:UiByeAt         = $null
+$script:UiByeGraceMs    = 5000
+$script:UiIdleLimitMs   = 180000
+$script:UiStartGraceS   = 30
+$script:WebviewMode     = $null    # 'edge' or 'browser'
+$script:NextWindowCheck = [DateTime]::MinValue
+
+# Takes the first free port in Port..Port+9. Returns $true when the page is up.
 function Start-DebugUi([int]$Port) {
-    for ($p = $Port; $p -lt $Port + 10; $p++) {
+    if ($script:Listener) { return $true }
+    for ($p = $Port; $p -lt $Port + 10 -and $p -le 65535; $p++) {
         $l = New-Object System.Net.HttpListener
         $l.Prefixes.Add("http://localhost:$p/")
         try {
             $l.Start()
-            $script:UiUrl = "http://localhost:$p/"
-            return $l
+            $script:Listener   = $l
+            $script:CtxTask    = $null
+            $script:UiUrl      = "http://localhost:$p/"
+            $script:UiIdleMs   = 0
+            $script:UiByeAt    = $null
+            Write-Log "debug page at $($script:UiUrl)"
+            return $true
         } catch { $l.Close() }
     }
-    return $null
+    # No page to show logs on, so this one goes to the terminal.
+    [Console]::Error.WriteLine("[api-cache-mcp] debug page disabled: ports $Port-$($Port + 9) are all busy")
+    return $false
+}
+
+function Stop-DebugUi([string]$Why) {
+    if (-not $script:Listener) { return }
+    $port = ([uri]$script:UiUrl).Port
+    try { $script:Listener.Stop(); $script:Listener.Close() } catch {}
+    $script:Listener = $null
+    $script:CtxTask  = $null
+    $script:UiUrl    = $null
+    $script:UiByeAt  = $null
+    Write-Log "debug page closed ($Why); port $port released"
+}
+
+# Called once per main-loop turn, after any page request was handled.
+function Update-DebugUiLifetime([int]$WaitedMs) {
+    if (-not $script:Listener) { return }
+    if ($script:UiPageSeen) { $script:UiPageSeen = $false; $script:UiIdleMs = 0 }
+    else { $script:UiIdleMs += $WaitedMs }
+    $now = [DateTime]::UtcNow
+
+    if ($script:UiByeAt -and ($now - $script:UiByeAt).TotalMilliseconds -ge $script:UiByeGraceMs) {
+        if ($script:WebviewMode -eq 'edge') { Stop-OwnWebview }   # Edge may linger without a window
+        Stop-DebugUi 'the window was closed'; return
+    }
+    if ($script:UiIdleMs -ge $script:UiIdleLimitMs) {
+        Stop-DebugUi "no request from the page for $([int]($script:UiIdleLimitMs / 1000)) s"; return
+    }
+    $young = $script:LastWebviewLaunch -and ($now - $script:LastWebviewLaunch).TotalSeconds -lt $script:UiStartGraceS
+    if ($script:WebviewMode -eq 'edge' -and -not $young -and $now -ge $script:NextWindowCheck) {
+        $script:NextWindowCheck = $now.AddSeconds(5)
+        if (-not (Test-OwnWindowOpen)) {
+            Stop-OwnWebview   # Edge may keep running in the background without a window
+            Stop-DebugUi 'the window was closed'
+        }
+    }
 }
 
 # --- Debug window (one at a time, across all api-cache server instances) ---
@@ -1481,7 +1557,7 @@ function Start-DebugUi([int]$Port) {
 # inherit our stdout.
 $script:WebviewProfile    = $null
 $script:LastWebviewLaunch = $null
-$script:WatchdogStarted   = $false
+$script:Watchdogs         = @{}    # one per profile folder (the port can change between opens)
 
 function Get-WebviewBase {
     $b = $env:LOCALAPPDATA
@@ -1514,10 +1590,19 @@ function Stop-OwnWebview {
     Stop-Processes @(Get-WebviewProcesses | Where-Object { Test-ProfileMatch $_.CommandLine $script:WebviewProfile })
 }
 
+# True while one of our window's Edge processes still shows a window.
+function Test-OwnWindowOpen {
+    if (-not $script:WebviewProfile) { return $false }
+    foreach ($p in @(Get-WebviewProcesses | Where-Object { Test-ProfileMatch $_.CommandLine $script:WebviewProfile })) {
+        try { if ((Get-Process -Id $p.ProcessId -ErrorAction Stop).MainWindowHandle -ne [IntPtr]::Zero) { return $true } } catch {}
+    }
+    return $false
+}
+
 function Start-WebviewWatchdog {
     # A hidden process that waits for this server to exit (any way: client
     # disconnect, Ctrl+C, console closed, crash) and then closes our window.
-    if ($script:WatchdogStarted) { return }
+    if ($script:Watchdogs.ContainsKey($script:WebviewProfile)) { return }
     try {
         $dir = $script:WebviewProfile.Replace("'", "''")
         $cmd = "Wait-Process -Id $PID -ErrorAction SilentlyContinue; " +
@@ -1527,15 +1612,21 @@ function Start-WebviewWatchdog {
         $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($cmd))
         Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
             '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc)
-        $script:WatchdogStarted = $true
+        $script:Watchdogs[$script:WebviewProfile] = $true
     } catch { Write-Log "could not start the window watchdog: $($_.Exception.Message)" 'warn' }
 }
 
 # Idempotent: focuses our window if it is open, otherwise closes any other
 # api-cache window and opens ours. Never leaves two windows.
 function Open-Webview {
-    if (-not $script:UiUrl) { return @{ Status = 'unavailable'; Message = 'The debug page is not running (no free port).' } }
-    if (-not $script:WebviewProfile) { $script:WebviewProfile = Join-Path (Get-WebviewBase) "webview-$(([uri]$script:UiUrl).Port)" }
+    if (-not $script:Listener) {
+        $port = (Get-Settings).UiPort
+        if (-not (Start-DebugUi $port)) {
+            return @{ Status = 'unavailable'; Message = "The debug page could not start: ports $port-$($port + 9) are all busy." }
+        }
+    }
+    # The profile folder follows the port, which can change each time the page starts.
+    $script:WebviewProfile = Join-Path (Get-WebviewBase) "webview-$(([uri]$script:UiUrl).Port)"
 
     $all    = @(Get-WebviewProcesses)
     $own    = @($all | Where-Object { Test-ProfileMatch $_.CommandLine $script:WebviewProfile })
@@ -1568,9 +1659,15 @@ function Open-Webview {
             '--no-first-run', '--no-default-browser-check', '--hide-crash-restore-bubble',
             '--window-size=640,860')
     } catch {
-        try { Start-Process $script:UiUrl } catch { return @{ Status = 'failed'; Message = "Could not open a browser: $($_.Exception.Message)" } }
-        return @{ Status = 'opened_in_browser'; Message = "Edge was not found, so the page opened in the default browser (that tab can not be tracked or closed automatically).$note" }
+        try { Start-Process $script:UiUrl } catch {
+            Stop-DebugUi 'no browser could be opened'
+            return @{ Status = 'failed'; Message = "Could not open a browser: $($_.Exception.Message)" }
+        }
+        $script:WebviewMode       = 'browser'
+        $script:LastWebviewLaunch = [DateTime]::UtcNow
+        return @{ Status = 'opened_in_browser'; Message = "Edge was not found, so the page opened in the default browser (the server can't close that tab; its port is released once the tab is closed).$note" }
     }
+    $script:WebviewMode       = 'edge'
     $script:LastWebviewLaunch = [DateTime]::UtcNow
     Start-WebviewWatchdog
     return @{ Status = 'opened'; Message = "Opened the debug window.$note" }
@@ -1598,13 +1695,24 @@ function Invoke-HttpRequest($Ctx) {
         $path = $req.Url.AbsolutePath
 
         if ($req.HttpMethod -eq 'GET' -and $path -eq '/') {
+            $script:UiPageSeen = $true; $script:UiByeAt = $null
             Send-Http $res 200 'text/html; charset=utf-8' $script:UiHtml
             return
         }
 
         if ($path.StartsWith('/api/')) {
             # A per-launch token stops other web pages in your browser from calling the API.
-            if ($req.Headers['X-Debug-Token'] -ne $script:UiToken) { Send-Http $res 403 'text/plain' 'Bad token'; return }
+            $token = $req.Headers['X-Debug-Token']
+            if (-not $token -and $path -eq '/api/bye') { $token = $req.QueryString['token'] }   # sendBeacon can't set headers
+            if ($token -ne $script:UiToken) { Send-Http $res 403 'text/plain' 'Bad token'; return }
+            $script:UiPageSeen = $true; $script:UiByeAt = $null
+
+            if ($req.HttpMethod -eq 'POST' -and $path -eq '/api/bye') {
+                # The page is closing or reloading. Release the port unless it comes back soon.
+                $script:UiByeAt = [DateTime]::UtcNow
+                Send-Http $res 200 'text/plain' 'bye'
+                return
+            }
 
             if ($req.HttpMethod -eq 'GET' -and $path -eq '/api/history') {
                 $since = 0
@@ -1659,33 +1767,32 @@ $keyLevel = 'info'
 if (-not $startup.ApiKey) { $keyLevel = 'warn' }
 Write-Log "started (PowerShell $($PSVersionTable.PSVersion)), model $($startup.Model), API key $keyState, prompt caching on ($($startup.CacheTtl) TTL), $($script:History.Count) history entries" $keyLevel
 
-$script:Listener = Start-DebugUi $startup.UiPort
-if ($script:Listener) {
-    Write-Log "debug page at $($script:UiUrl)"
-    if ($startup.UiOpen) {
-        $w = Open-Webview
-        $lvl = 'info'; if ($w.Status -notin @('opened', 'already_open', 'starting')) { $lvl = 'warn' }
-        Write-Log $w.Message $lvl
-    }
+# The debug page (and its port) only exists while its window is open.
+if ($startup.UiOpen) {
+    $w = Open-Webview
+    $lvl = 'info'; if ($w.Status -notin @('opened', 'already_open', 'starting')) { $lvl = 'warn' }
+    Write-Log $w.Message $lvl
 } else {
-    # No page to show logs on, so this one goes to the terminal.
-    [Console]::Error.WriteLine("[api-cache-mcp] debug page disabled: ports $($startup.UiPort)-$($startup.UiPort + 9) are all busy")
+    Write-Log 'debug window not opened at startup (MCP_UI_OPEN=false); debug_open_webview opens it'
 }
 
 # ---------------------------------------------------------------------------
 # Main loop: wait on stdin and the HTTP listener at the same time, one thread.
 # A Claude call blocks both briefly, which is fine for a debugging tool.
+# The listener comes and goes with the window, so it is checked every turn.
 # ---------------------------------------------------------------------------
-$readTask = $script:In.ReadLineAsync()
-$ctxTask  = $null
-if ($script:Listener) { $ctxTask = $script:Listener.GetContextAsync() }
+$readTask  = $script:In.ReadLineAsync()
+$waitClock = New-Object System.Diagnostics.Stopwatch
 
 try {
     while ($true) {
+        if ($script:Listener -and -not $script:CtxTask) { $script:CtxTask = $script:Listener.GetContextAsync() }
         $tasks = New-Object 'System.Collections.Generic.List[System.Threading.Tasks.Task]'
         $tasks.Add($readTask)
-        if ($ctxTask) { $tasks.Add($ctxTask) }
+        if ($script:CtxTask) { $tasks.Add($script:CtxTask) }
+        $waitClock.Restart()
         [void][System.Threading.Tasks.Task]::WaitAny($tasks.ToArray(), 1000)
+        $waited = [int]$waitClock.ElapsedMilliseconds
 
         if ($readTask.IsCompleted) {
             if ($readTask.IsFaulted) { Write-Log 'stdin read failed' 'error'; break }
@@ -1698,15 +1805,18 @@ try {
             $readTask = $script:In.ReadLineAsync()
         }
 
-        if ($ctxTask -and $ctxTask.IsCompleted) {
-            if ($ctxTask.IsFaulted) { Write-Log 'debug page listener error' 'error' }
-            else { Invoke-HttpRequest $ctxTask.Result }
-            $ctxTask = $script:Listener.GetContextAsync()
+        if ($script:CtxTask -and $script:CtxTask.IsCompleted) {
+            $t = $script:CtxTask
+            $script:CtxTask = $null   # the next turn asks for the next request
+            if ($t.IsFaulted) { Write-Log 'debug page listener error' 'error' }
+            else { Invoke-HttpRequest $t.Result }
         }
+
+        Update-DebugUiLifetime $waited
     }
 }
 finally {
-    if ($script:Listener) { try { $script:Listener.Stop(); $script:Listener.Close() } catch {} }
+    Stop-DebugUi 'server stopping'
     # Fast path for a normal exit; the watchdog covers everything else.
     Stop-OwnWebview
 }
