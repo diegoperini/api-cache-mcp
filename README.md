@@ -2,10 +2,10 @@
 
 A local MCP server that gives your AI agents a shared, semantic cache of
 everything they learn about the APIs they use: CLI tools, other MCP servers,
-REST APIs, SDKs, and apps such as Blender or Unreal. Agents ask it questions
-and tell it what they discovered, in plain language. A small Claude model
-(Haiku by default) reads the relevant cache, answers or edits it, and forgets
-everything before the next call.
+REST APIs, SDKs, and apps such as Blender, Unreal Engine, Krita or Cheat
+Engine. Agents ask it questions and tell it what they discovered, in plain
+language. A small Claude model (Haiku by default) reads the relevant cache,
+answers or edits it, and forgets everything before the next call.
 
 - Runs on Windows with the built-in Windows PowerShell 5.1. Nothing to
   install, no dependencies.
@@ -170,14 +170,23 @@ When the server starts, it opens a small Edge app window on
 - an input box that sends a test prompt through `ask_claude` (Enter sends,
   Shift+Enter adds a new line).
 
-The window closes when the server stops. Only one window is ever open, even
-when several server instances are running. If you close it by accident, ask
-any connected agent to call `debug_open_webview`.
+There is only ever one window, and it shows the calls of every connected
+client. Each MCP client starts its own copy of the server (Claude Desktop can
+start two), but only the first copy, the primary, serves: it holds
+`primary.lock` in the install folder, owns the window and the history, and
+answers every client. Copies started later open no window; they pass their
+client's messages to the primary over a named pipe. If the primary goes
+away, one of them takes over.
 
-The port is only held while the window is open. Each server instance takes a
-port when its window opens and releases it when the window closes, so closed
-windows never block other programs or other instances. The server notices a
-closed window in three ways:
+The primary keeps running after the client that started it disconnects,
+while other clients are connected or the window is open. When nothing is
+left, it stops and closes the window. If you close the window by accident,
+ask any connected agent to call `debug_open_webview`.
+
+The port is only held while the window is open: the primary takes a port
+when the window opens and releases it when the window closes, so a closed
+window never blocks other programs. The server notices a closed window in
+three ways:
 
 - the page says goodbye when it closes (after 5 seconds, so a reload keeps
   the port);
@@ -202,6 +211,7 @@ memory while the window is closed and show up again when it reopens. With
 | `cache\<agent>\<api>.md` | The caches, plain text. Created at runtime; you can read or edit them by hand. |
 | `cache\<agent>\_vault\` | Fallback vault for agents that have no vault of their own. |
 | `history.jsonl` | Log of every Claude call, shown on the debug page. Created at runtime. |
+| `primary.lock` | Held by the copy of the server that serves every client. Created at runtime; ignored by git. |
 
 `.env`, `cache\`, `history.jsonl` and the contents of `context\` are listed
 in `.gitignore`, so your key and your data stay out of the repository.
@@ -237,6 +247,13 @@ locally is encrypted.
 - **Tools don't show up in Claude Desktop:** check
   `%APPDATA%\Claude\logs\mcp-server-api-cache.log`. The server only writes to
   the terminal on a fatal error, or when no debug port is free.
+- **A call waits while another client's call runs:** one server answers
+  every client, one call at a time, so calls from several clients queue up
+  behind each other.
+- **A client's log says "serving this client on its own":** a copy of the
+  server found the primary's lock taken but couldn't reach it through the
+  pipe, so it serves its client alone, without the window. Restarting the
+  MCP client usually fixes it.
 - **The debug window says "page closed":** the server released the page's
   port after deciding the window was gone. Ask any connected agent to call
   `debug_open_webview`.

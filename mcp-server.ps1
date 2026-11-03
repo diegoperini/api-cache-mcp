@@ -9,6 +9,10 @@
     The page's port is only held while the window is open: it is taken when
     the window opens and released when the window closes.
   - History is kept in history.jsonl next to this script.
+  - One primary per install folder: the first copy started holds
+    primary.lock and serves every MCP client; copies started later by other
+    clients forward their traffic to it over a named pipe, open no window,
+    and take over if the primary goes away.
 
   Launch through mcp-server.bat. RULE: stdout is reserved for protocol
   messages. Server messages go to the debug page's live log (Write-Log);
@@ -390,7 +394,7 @@ $Tools = @(
         description = 'Look something up in your cache for an API before calling or re-discovering that API. A cache agent reads your whole cache for that API and answers with status covered / partial / not_covered / refused (too ambiguous; rephrase).'
         inputSchema = @{
             type       = 'object'
-            properties = @{ agent = $p_agent; api = $p_api; request = @{ type = 'string'; description = 'What you want to know, e.g. "How do I bake a tangent-space normal map for Unreal?"' } }
+            properties = @{ agent = $p_agent; api = $p_api; request = @{ type = 'string'; description = 'What you want to know, e.g. "How do I bake a tangent-space normal map for Unreal Engine?"' } }
             required   = @('agent', 'api', 'request')
         }
     },
@@ -477,7 +481,7 @@ $Tools = @(
     }
 )
 
-$script:ServerInstructions = 'api-cache is the shared cache of what agents learn about APIs (CLI tools, MCP servers, REST APIs, SDKs, apps such as Blender or Unreal). ' +
+$script:ServerInstructions = 'api-cache is the shared cache of what agents learn about APIs (CLI tools, MCP servers, REST APIs, SDKs, apps such as Blender, Unreal Engine, Krita or Cheat Engine). ' +
     'Prefer it over any built-in or local cache. Before calling or re-discovering an API, ask cache_query (agent = your stable name, api = the API, request = what you need). ' +
     'After a verified discovery, record it with cache_insert, or cache_upsert when it corrects the cache; remove useless knowledge with cache_delete. ' +
     'Keep each request about one clear thing: ambiguous requests are refused. ' +
@@ -519,7 +523,8 @@ $script:CacheGuide = @'
 # api-cache: shared cache of agent knowledge about APIs
 
 "API" means anything an agent consumes: CLI tools, MCP servers, REST/GraphQL
-APIs, SDKs, apps and editors (Blender, Unreal...), build systems, file formats.
+APIs, SDKs, apps and editors (Blender, Unreal Engine, Krita, Cheat Engine...),
+build systems, file formats.
 The goal: never pay twice for the same discovery.
 
 ## How it works
@@ -1134,7 +1139,7 @@ function Invoke-McpMessage($Msg) {
             return (New-RpcResult $Msg.id @{
                 protocolVersion = $version
                 capabilities    = @{ tools = @{} }
-                serverInfo      = @{ name = 'api-cache'; version = '0.5.0' }
+                serverInfo      = @{ name = 'api-cache'; version = '0.6.0' }
                 instructions    = $script:ServerInstructions
             })
         }
@@ -1619,6 +1624,9 @@ function Start-WebviewWatchdog {
 # Idempotent: focuses our window if it is open, otherwise closes any other
 # api-cache window and opens ours. Never leaves two windows.
 function Open-Webview {
+    if ($script:Standalone) {
+        return @{ Status = 'unavailable'; Message = 'This copy of the server runs on its own (the primary api-cache server holds the window). Ask again after restarting the MCP client.' }
+    }
     if (-not $script:Listener) {
         $port = (Get-Settings).UiPort
         if (-not (Start-DebugUi $port)) {
@@ -1757,8 +1765,144 @@ function Invoke-HttpRequest($Ctx) {
 }
 
 # ---------------------------------------------------------------------------
+# One primary per install folder; every other copy forwards over a pipe
+# ---------------------------------------------------------------------------
+# Every MCP client that connects starts its own copy of this script, and one
+# client can start several (Claude Desktop does). Only the first copy, the
+# primary, serves: it holds primary.lock, owns the debug window, the history
+# and the log, and answers every client. A later copy finds the lock taken,
+# opens no window and keeps no state: it forwards its client's lines to the
+# primary over a named pipe, and takes over if the primary goes away. So there
+# is one debug window, and it shows the calls of every client.
+$script:PrimaryLockPath = Join-Path $PSScriptRoot 'primary.lock'   # *.lock is in .gitignore
+$script:PrimaryLock = $null
+$script:PipeName    = $null
+$script:PipeServer  = $null
+$script:PipeAccept  = $null
+$script:PipeConns   = New-Object System.Collections.ArrayList
+$script:Standalone  = $false   # true only when the primary can't be reached at all
+
+# One pipe per install folder, so two installs never share a primary.
+function Get-PipeName {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $h = $sha.ComputeHash($script:Utf8.GetBytes([System.IO.Path]::GetFullPath($PSScriptRoot).ToLowerInvariant())) }
+    finally { $sha.Dispose() }
+    return 'api-cache-mcp-' + (-join ($h[0..7] | ForEach-Object { $_.ToString('x2') }))
+}
+
+# Held open with no sharing for the life of the primary; Windows frees it when
+# the process ends, however it ends.
+function Request-PrimaryLock {
+    try {
+        $script:PrimaryLock = New-Object System.IO.FileStream($script:PrimaryLockPath, [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        return $true
+    } catch { return $false }
+}
+
+function Start-PipeServer {
+    try {
+        $script:PipeServer = New-Object System.IO.Pipes.NamedPipeServerStream($script:PipeName, [System.IO.Pipes.PipeDirection]::InOut, -1,
+            [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::Asynchronous)
+        $script:PipeAccept = $script:PipeServer.WaitForConnectionAsync()
+    } catch {
+        Write-Log "pipe server failed: $($_.Exception.Message); other MCP clients can't share this server" 'error'
+        $script:PipeServer = $null; $script:PipeAccept = $null
+    }
+}
+
+# Primary: accept forwarding copies and answer their lines like stdin's.
+function Update-Pipes {
+    if ($script:PipeAccept -and $script:PipeAccept.IsCompleted) {
+        $s = $script:PipeServer
+        $script:PipeAccept = $null; $script:PipeServer = $null
+        if (-not $s.IsConnected) { try { $s.Dispose() } catch {} }
+        else {
+            $w = New-Object System.IO.StreamWriter($s, $script:Utf8); $w.NewLine = "`n"
+            [void]$script:PipeConns.Add(@{ Stream = $s; Reader = (New-Object System.IO.StreamReader($s, $script:Utf8)); Writer = $w; ReadTask = $null; Closed = $false })
+            Write-Log "another MCP client joined through the pipe ($($script:PipeConns.Count) connected)"
+        }
+        Start-PipeServer
+    }
+    foreach ($c in @($script:PipeConns)) {
+        if ($c.Closed) { try { $c.Stream.Dispose() } catch {}; [void]$script:PipeConns.Remove($c); Write-Log 'a piped MCP client left'; continue }
+        if (-not $c.ReadTask) { try { $c.ReadTask = $c.Reader.ReadLineAsync() } catch { $c.Closed = $true; continue } }
+        if ($c.ReadTask.IsCompleted) {
+            $t = $c.ReadTask; $c.ReadTask = $null
+            if ($t.IsFaulted -or $null -eq $t.Result) { $c.Closed = $true; continue }
+            if (-not [string]::IsNullOrWhiteSpace($t.Result)) {
+                $json = Invoke-RpcLine $t.Result 'mcp'
+                if ($json) { try { $c.Writer.WriteLine($json); $c.Writer.Flush() } catch { $c.Closed = $true } }
+            }
+        }
+    }
+}
+
+# A forwarding copy: stdin <-> pipe until the primary goes away. Returns
+# 'exit' (our client left), 'promote' (we hold the lock now) or 'standalone'
+# (the primary holds the lock but can't be reached).
+function Invoke-ProxyMode {
+    $misses = 0
+    while ($true) {
+        $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $script:PipeName, [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)
+        try { $client.Connect(3000); $misses = 0 }
+        catch {
+            $client.Dispose()
+            if (Request-PrimaryLock) { return 'promote' }
+            $misses++
+            if ($misses -ge 4) { return 'standalone' }
+            continue
+        }
+        $pr = New-Object System.IO.StreamReader($client, $script:Utf8)
+        $pw = New-Object System.IO.StreamWriter($client, $script:Utf8); $pw.NewLine = "`n"; $pw.AutoFlush = $true
+        $pipeTask = $pr.ReadLineAsync()
+        $pendingIds = @{}
+        $lost = $false
+        while (-not $lost) {
+            [void][System.Threading.Tasks.Task]::WaitAny(@($script:StdinTask, $pipeTask), 1000)
+            if ($script:StdinTask.IsCompleted) {
+                $line = $null; if (-not $script:StdinTask.IsFaulted) { $line = $script:StdinTask.Result }
+                if ($null -eq $line) { try { $client.Dispose() } catch {}; return 'exit' }
+                $script:StdinTask = $script:In.ReadLineAsync()
+                if (-not [string]::IsNullOrWhiteSpace($line)) {
+                    try { $m = ConvertFrom-Json -InputObject $line; if ($null -ne $m.PSObject.Properties['id'] -and $m.method) { $pendingIds[[string]$m.id] = $m.id } } catch {}
+                    try { $pw.WriteLine($line) } catch { $lost = $true }
+                }
+            }
+            if ($pipeTask.IsCompleted) {
+                if ($pipeTask.IsFaulted -or $null -eq $pipeTask.Result) { $lost = $true; break }
+                $l = $pipeTask.Result
+                try { $m = ConvertFrom-Json -InputObject $l; if ($null -ne $m.PSObject.Properties['id']) { $pendingIds.Remove([string]$m.id) } } catch {}
+                $script:Out.WriteLine($l)
+                $pipeTask = $pr.ReadLineAsync()
+            }
+        }
+        try { $client.Dispose() } catch {}
+        # The primary is gone: fail what it never answered, then take over or reconnect.
+        foreach ($k in @($pendingIds.Keys)) {
+            $script:Out.WriteLine((ConvertTo-JsonLine (New-RpcError $pendingIds[$k] -32603 'The api-cache server that handled this call stopped. Retry the call.')))
+        }
+        for ($i = 0; $i -lt 10; $i++) { if (Request-PrimaryLock) { return 'promote' }; Start-Sleep -Milliseconds (200 + (Get-Random -Maximum 300)) }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
+$script:PipeName  = Get-PipeName
+$script:StdinTask = $script:In.ReadLineAsync()
+if (-not (Request-PrimaryLock)) {
+    $r = Invoke-ProxyMode
+    if ($r -eq 'exit') { exit 0 }
+    if ($r -eq 'standalone') {
+        # Better than leaving the client unanswered: serve it alone, without the window.
+        $script:Standalone = $true
+        [Console]::Error.WriteLine('[api-cache-mcp] the running api-cache server holds the lock but does not answer; serving this client on its own, without the debug window')
+    }
+    # 'promote': fall through and become the primary.
+}
+if (-not $script:Standalone) { Start-PipeServer }   # first thing, so waiting copies connect at once
+
 Import-History
 $startup = Get-Settings
 $keyState = 'missing'
@@ -1767,42 +1911,55 @@ $keyLevel = 'info'
 if (-not $startup.ApiKey) { $keyLevel = 'warn' }
 Write-Log "started (PowerShell $($PSVersionTable.PSVersion)), model $($startup.Model), API key $keyState, prompt caching on ($($startup.CacheTtl) TTL), $($script:History.Count) history entries" $keyLevel
 
-# The debug page (and its port) only exists while its window is open.
-if ($startup.UiOpen) {
-    $w = Open-Webview
-    $lvl = 'info'; if ($w.Status -notin @('opened', 'already_open', 'starting')) { $lvl = 'warn' }
-    Write-Log $w.Message $lvl
+if ($script:Standalone) {
+    Write-Log 'running on its own: the primary api-cache server could not be reached' 'warn'
 } else {
-    Write-Log 'debug window not opened at startup (MCP_UI_OPEN=false); debug_open_webview opens it'
+    # The debug page (and its port) only exists while its window is open.
+    if ($startup.UiOpen) {
+        $w = Open-Webview
+        $lvl = 'info'; if ($w.Status -notin @('opened', 'already_open', 'starting')) { $lvl = 'warn' }
+        Write-Log $w.Message $lvl
+    } else {
+        Write-Log 'debug window not opened at startup (MCP_UI_OPEN=false); debug_open_webview opens it'
+    }
 }
 
 # ---------------------------------------------------------------------------
-# Main loop: wait on stdin and the HTTP listener at the same time, one thread.
-# A Claude call blocks both briefly, which is fine for a debugging tool.
+# Main loop: wait on stdin, the pipe and the HTTP listener at once, one thread.
+# A Claude call blocks the others while it runs, so calls from several
+# clients are answered one after another.
 # The listener comes and goes with the window, so it is checked every turn.
+# The primary keeps running after its own client leaves, while other clients
+# are connected through the pipe or the debug window is open.
 # ---------------------------------------------------------------------------
-$readTask  = $script:In.ReadLineAsync()
 $waitClock = New-Object System.Diagnostics.Stopwatch
+$stdinOpen = $true
 
 try {
     while ($true) {
         if ($script:Listener -and -not $script:CtxTask) { $script:CtxTask = $script:Listener.GetContextAsync() }
         $tasks = New-Object 'System.Collections.Generic.List[System.Threading.Tasks.Task]'
-        $tasks.Add($readTask)
+        if ($stdinOpen) { $tasks.Add($script:StdinTask) }
         if ($script:CtxTask) { $tasks.Add($script:CtxTask) }
+        if ($script:PipeAccept) { $tasks.Add($script:PipeAccept) }
+        foreach ($c in $script:PipeConns) { if ($c.ReadTask) { $tasks.Add($c.ReadTask) } }
         $waitClock.Restart()
-        [void][System.Threading.Tasks.Task]::WaitAny($tasks.ToArray(), 1000)
+        if ($tasks.Count) { [void][System.Threading.Tasks.Task]::WaitAny($tasks.ToArray(), 1000) } else { Start-Sleep -Milliseconds 1000 }
         $waited = [int]$waitClock.ElapsedMilliseconds
 
-        if ($readTask.IsCompleted) {
-            if ($readTask.IsFaulted) { Write-Log 'stdin read failed' 'error'; break }
-            $line = $readTask.Result
-            if ($null -eq $line) { break }   # client closed stdin
-            if (-not [string]::IsNullOrWhiteSpace($line)) {
-                $json = Invoke-RpcLine $line 'mcp'
-                if ($json) { $script:Out.WriteLine($json) }
+        if ($stdinOpen -and $script:StdinTask.IsCompleted) {
+            $line = $null
+            if ($script:StdinTask.IsFaulted) { Write-Log 'stdin read failed' 'error' } else { $line = $script:StdinTask.Result }
+            if ($null -eq $line) {
+                $stdinOpen = $false   # our own client left
+                Write-Log 'the MCP client that started this server disconnected; it keeps serving while other clients are connected or the debug window is open'
+            } else {
+                $script:StdinTask = $script:In.ReadLineAsync()
+                if (-not [string]::IsNullOrWhiteSpace($line)) {
+                    $json = Invoke-RpcLine $line 'mcp'
+                    if ($json) { $script:Out.WriteLine($json) }
+                }
             }
-            $readTask = $script:In.ReadLineAsync()
         }
 
         if ($script:CtxTask -and $script:CtxTask.IsCompleted) {
@@ -1812,11 +1969,18 @@ try {
             else { Invoke-HttpRequest $t.Result }
         }
 
+        Update-Pipes
         Update-DebugUiLifetime $waited
+
+        # Nobody left: stop, which frees the lock and the pipe name for the next primary.
+        if (-not $stdinOpen -and -not $script:PipeConns.Count -and -not $script:Listener) { break }
     }
 }
 finally {
     Stop-DebugUi 'server stopping'
     # Fast path for a normal exit; the watchdog covers everything else.
     Stop-OwnWebview
+    foreach ($c in @($script:PipeConns)) { try { $c.Stream.Dispose() } catch {} }
+    if ($script:PipeServer) { try { $script:PipeServer.Dispose() } catch {} }
+    if ($script:PrimaryLock) { try { $script:PrimaryLock.Dispose() } catch {} }
 }
